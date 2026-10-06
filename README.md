@@ -1,60 +1,80 @@
 # arcserve
 
 A small OpenAI-compatible server for [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai) on Intel Arc
-GPUs, with continuous batching and tool calling. Built to run **Gemma 4 26B-A4B** on a single **Arc Pro B60 (24 GB)**
-for agentic coding tools such as Qwen Code.
+GPUs, with continuous batching and tool calling. Built and tested with **Gemma 4 26B-A4B** on a single
+**Arc Pro B60 (24 GB)**.
 
-Status: experimental. Tested on one machine (Arc Pro B60, Ubuntu 26.04, xe driver) with
+Status: experimental. One machine (Arc Pro B60, Ubuntu 26.04, xe driver), OpenVINO / GenAI 2026.4.1,
 [`OpenVINO/gemma-4-26b-a4b-it-int4-ov`](https://huggingface.co/OpenVINO/gemma-4-26b-a4b-it-int4-ov).
 
-## Why
+## Findings first
+
+- **arcserve is the fastest way we found to serve Gemma 4 26B-A4B on one B60**: ~60 tok/s single stream and
+  ~117 tok/s across 3 streams, with working tool calls.
+- **Gemma 4 26B-A4B is not a good coding agent in our tests, on any stack.** In an agentic coding harness (OpenCode,
+  same harness on which a Qwen3.6-35B-A3B build passes the same ticket first try) it failed on arcserve *and* on
+  llama.cpp with Google's own QAT Q4_0 build: it quotes code for `edit` calls without the blank lines between
+  methods, so the edits never match, and it repeats the mistake dozens of times. That's the model, not the server.
+- **For Gemma 4 chat on Arc, llama.cpp (SYCL) with Google's QAT Q4_0 GGUF works correctly out of the box** (tool calls,
+  long-context recall, prompt caching): ~40 tok/s single stream. arcserve is faster; llama.cpp needs no workarounds.
+- **Long context in fp16 is fragile** with this int4 export: at ~28k tokens the output depends on the prefill chunk
+  size. Details and a repro in
+  [openvino.genai#4146](https://github.com/openvinotoolkit/openvino.genai/issues/4146#issuecomment-6009326327).
+
+## Why a custom server
 
 On this card, the ready-made options each broke somewhere:
 
 | Option | What happened |
 |---|---|
-| vLLM (Intel `llm-scaler-vllm` 0.26) with GPTQ / compressed-tensors Gemma 4 | ~20 tok/s: no fast MoE kernel for Gemma on XPU; XPU graph capture fails, so it needs eager mode |
+| vLLM (Intel `llm-scaler-vllm` 0.26) with GPTQ / compressed-tensors Gemma 4 | ~20 tok/s (no fast MoE kernel for Gemma on XPU); XPU graph capture fails; the image ships transformers 5.8, and Gemma 4 needs >= 5.10.4 ([vllm#45259](https://github.com/vllm-project/vllm/issues/45259)) |
 | OpenVINO Model Server 2026.4.0 | segfaults initialising Gemma 4 (VLM continuous batching) or on the first request |
-| OpenArc | works, but serves one request at a time; its tool-argument parser splits on commas |
-| OpenVINO GenAI directly | **fast (55-65 tok/s) and correct**, but it's a library, not a server |
+| OpenArc | works, but serves one request at a time |
+| OpenVINO GenAI directly | fast and correct, but a library, not a server |
 
-arcserve is the thin server around the part that works.
+## What arcserve does
 
-## What it does
+- Runs `openvino_genai.ContinuousBatchingPipeline` in **its own process**. `step()` holds the Python GIL while the GPU
+  works; in a thread of the web server it starved the HTTP threads (requests admitted one at a time, tokens arriving
+  in a burst at the end). Requests and token ids cross over `multiprocessing` queues.
+- Renders prompts with Hugging Face `transformers` (tools, thinking on/off) and passes text to the pipeline (VLM
+  exports run the language model on `inputs_embeds`). **Keeps `<bos>`:** the OpenVINO tokenizer encodes it but never
+  adds it, and Gemma degenerates without it.
+- **Stops on the model's own stop tokens** (`generation_config.json`: for Gemma 4 that includes `<|tool_response>`,
+  where the model hands over to the tool; without it the model invents its own tool results).
+- **Gemma 4 tool calls** (`toolparse.py`): native `<|tool_call>call:name{...}<tool_call|>` with strings delimited by
+  Gemma's quote token (commas, braces and quotes inside file contents are safe), plus a fallback for the plain-text
+  form Gemma produces when it copies a client's prompt examples (`[tool_call: read_file {file_path: '...'}]`).
+- Streaming that holds back tool-call text, sends a keep-alive chunk every 3 s (clients such as Qwen Code abort a
+  stream after 240 s without data; long prefills take that long), and cancels a reply that keeps repeating the same
+  tool call.
+- `/metrics` with vLLM-style names; optional request/response logging for debugging (`ARC_LOG_DIR`).
 
-- `openvino_genai.ContinuousBatchingPipeline` in **its own process**. `step()` holds the Python GIL while the GPU
-  works; run in a thread of the web server it starved the HTTP threads (requests were admitted one at a time and tokens
-  arrived in a burst at the end). Requests and token ids cross over `multiprocessing` queues.
-- `DYNAMIC_QUANTIZATION_GROUP_SIZE=0`, needed for continuous batching with these int4 MoE exports (found by
-  [DassaultFalconKing/OpenVino-For-Gemma-4](https://github.com/DassaultFalconKing/OpenVino-For-Gemma-4)).
-- Chat templating with Hugging Face `transformers` (tools, thinking off), prompts passed as text (VLM exports run the
-  language model on `inputs_embeds`).
-- **Gemma 4 tool calls** (`toolparse.py`): the native `<|tool_call>call:name{...}<tool_call|>` format, where strings are
-  delimited by Gemma's quote token, so commas, braces and quotes inside file contents are safe; plus a fallback for
-  the plain-text form Gemma produces when it copies examples from a client's system prompt
-  (`[tool_call: read_file {file_path: '...'}]` and `[tool_call: run_shell_command for '...']`).
-- Streaming that holds back tool-call text, sends keep-alive chunks while it does (clients such as Qwen Code abort a
-  stream after 240 s without data), and cancels a reply that keeps repeating the same tool call.
-- `/metrics` with vLLM-style names (`vllm:generation_tokens_total`, `vllm:num_requests_running`, ...).
+## Two ways to run Gemma 4
 
-## Measured (Arc Pro B60, Gemma 4 26B-A4B int4)
+| | Official export | RoPE-table patched export |
+|---|---|---|
+| Model | `OpenVINO/gemma-4-26b-a4b-it-int4-ov` as published | same, after `ov_rope_lut.py` (below) |
+| `ARC_PREFIX_CACHE` | `1` (works) | **`0`** (the patch breaks prefix caching: wrong answers) |
+| `ARC_BATCH_TOKENS` | up to `4096` | `512` or less |
+| Speed in an agent loop | fast (cached prefixes, ~2,000 tok/s prefill) | slow (re-reads the whole context each turn, ~1,500 tok/s) |
+| Long-context accuracy | fragile past ~20k tokens (#4146) | better: correct where the official export was not |
+
+The patch: [DassaultFalconKing/OpenVino-For-Gemma-4](https://github.com/DassaultFalconKing/OpenVino-For-Gemma-4)
+`patches/ov_rope_lut.py` replaces the runtime fp16 RoPE angle computation with precomputed sin/cos tables. For the
+official exports it needs a 3-line change (proposed upstream in
+[PR #3](https://github.com/DassaultFalconKing/OpenVino-For-Gemma-4/pull/3)); run it with `LUT_MAXPOS=65536`.
+arcserve's defaults (`ARC_PREFIX_CACHE=0`, `ARC_BATCH_TOKENS=512`) are safe for both.
+
+## Measured (Arc Pro B60, Gemma 4 26B-A4B int4, official export, prefix cache on, chunk 4096)
 
 | Concurrent streams | Combined decode | Time to first token |
 |---|---|---|
-| 1 | ~60 tok/s | ~0.4-1 s |
-| 2 | ~80 tok/s | ~0.3 s |
-| 3 | ~105 tok/s | ~0.4-1.8 s |
-| 4 | ~130 tok/s | ~1.3 s |
+| 1 | ~60 tok/s | ~0.3 s |
+| 3 | ~117 tok/s | ~0.4 s |
 
-A 14k-token needle-in-a-haystack prompt is answered correctly (with the RoPE patch below), prefill ~1,000 tok/s.
-
-## Long context: patch the model first
-
-The official int4 export computes RoPE angles at runtime in fp16 on the GPU, which garbles output at long context.
-DassaultFalconKing's `patches/ov_rope_lut.py` replaces that with precomputed sin/cos tables. For the official
-`OpenVINO/gemma-4-*-int4-ov` exports it needs one change: in `trace_inv_freq`, also accept a `Constant` of shape
-`[1, F, 1]` fed straight into the `MatMul` (their exports go through a `Broadcast`). Run it with `LUT_MAXPOS=65536` for
-64k context.
+14k-token needle-in-a-haystack: correct, ~1,100 tok/s prefill. Measured with `llmbench.py`-style checks (tool call,
+concurrency, recall).
 
 ## Run
 
@@ -62,10 +82,13 @@ DassaultFalconKing's `patches/ov_rope_lut.py` replaces that with precomputed sin
 docker build -t arcserve .
 docker run -d --name arcserve --device /dev/dri --group-add $(getent group render | cut -d: -f3) \
   -v /dev/dri/by-path:/dev/dri/by-path -v /path/to/models:/models:ro -p 127.0.0.1:8080:8080 \
-  -e ARC_MODEL=/models/gemma-4-26b-a4b-it-int4-ov-ropelut -e ARC_MAX_SEQS=3 arcserve
+  -e ARC_MODEL=/models/gemma-4-26b-a4b-it-int4-ov -e ARC_MAX_SEQS=3 \
+  -e ARC_PREFIX_CACHE=1 -e ARC_BATCH_TOKENS=4096 arcserve
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"llm","messages":[{"role":"user","content":"Say hi"}],"max_tokens":20}'
 ```
+
+The base image (`intel/llm-scaler-vllm`) is used only for its Intel GPU runtime, which works on the B60.
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -75,11 +98,14 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 | `ARC_DEVICE` | `GPU` | |
 | `ARC_MAX_SEQS` | `4` | concurrent sequences |
 | `ARC_CACHE_GB` | `5` | KV cache size |
-| `ARC_BATCH_TOKENS` | `4096` | max tokens per scheduler step |
+| `ARC_BATCH_TOKENS` | `512` | prefill chunk (tokens per scheduler step) |
+| `ARC_PREFIX_CACHE` | `0` | `1` enables prefix caching (official export only) |
 | `ARC_MAX_NEW` | `8192` | cap on tokens per reply |
 | `ARC_MAX_CTX` | `65536` | prompt + reply limit |
 | `ARC_THINK` | `0` | `1` enables Gemma's thinking |
+| `ARC_CLOSE_THOUGHT_AFTER_TOOL` | `0` | `1` pre-closes an empty thought channel after tool results (experimental) |
 | `ARC_PARSER` | `gemma4` | `none` disables tool-call parsing |
+| `ARC_LOG_DIR` | unset | if set, saves each request and raw output there |
 
 ## Tests
 
@@ -90,5 +116,7 @@ python -m unittest discover tests   # parser tests; no model or GPU needed
 ## Credits
 
 - [DassaultFalconKing/OpenVino-For-Gemma-4](https://github.com/DassaultFalconKing/OpenVino-For-Gemma-4): the RoPE
-  table patch and the `DYNAMIC_QUANTIZATION_GROUP_SIZE=0` finding.
+  table patch and the `DYNAMIC_QUANTIZATION_GROUP_SIZE=0` setting used here.
 - [OpenArc](https://github.com/SearchSavior/OpenArc): documented Gemma 4's tool-call protocol.
+- [vpscloud's write-up](https://vpscloud.com.au/technical/two-flags-and-a-fortnight-getting-gemma-4-31b-to-fly-on-intel-arc-pro-b60s/)
+  of Gemma 4 on multi-B60 vLLM.

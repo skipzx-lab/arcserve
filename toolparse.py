@@ -7,7 +7,7 @@ PARSER = "gemma4"   # arcserve sets this from ARC_PARSER
 TOOL_OPEN, TOOL_CLOSE = "<|tool_call>", "<tool_call|>"
 CH_OPEN, CH_CLOSE = "<|channel>", "<channel|>"
 QUOTE = '<|"|>'
-STRIP = ("<turn|>", "<eos>", "<|turn>", "<bos>")
+STRIP = ("<turn|>", "<eos>", "<|turn>", "<bos>", "<|tool_response>")
 
 class _Args:
     """Gemma 4 tool-call arguments: {key:value,...}; strings are wrapped in <|"|> quote tokens; numbers, true/false/null,

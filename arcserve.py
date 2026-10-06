@@ -8,8 +8,8 @@ thinking off), and its own Gemma 4 tool-call parser (Gemma's quote tokens delimi
 contents are safe).
 
 Env: ARC_MODEL (OpenVINO model dir), ARC_NAME (served model name, default "llm"), ARC_PORT (8080), ARC_DEVICE (GPU),
-ARC_MAX_SEQS (4), ARC_CACHE_GB (5), ARC_BATCH_TOKENS (4096), ARC_MAX_NEW (8192: cap per reply), ARC_MAX_CTX (65536),
-ARC_THINK (0), ARC_PARSER (gemma4|none).
+ARC_MAX_SEQS (4), ARC_CACHE_GB (5), ARC_BATCH_TOKENS (512), ARC_PREFIX_CACHE (0), ARC_MAX_NEW (8192: cap per reply),
+ARC_MAX_CTX (65536), ARC_THINK (0), ARC_CLOSE_THOUGHT_AFTER_TOOL (0), ARC_PARSER (gemma4|none), ARC_LOG_DIR (unset).
 Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions (stream or not), GET /metrics (vllm:* names).
 """
 import json, os, queue, re, threading, time, uuid
@@ -29,11 +29,16 @@ PORT = int(os.environ.get("ARC_PORT", "8080"))
 DEVICE = os.environ.get("ARC_DEVICE", "GPU")
 MAX_SEQS = int(os.environ.get("ARC_MAX_SEQS", "4"))
 CACHE_GB = int(os.environ.get("ARC_CACHE_GB", "5"))
-BATCH_TOKENS = int(os.environ.get("ARC_BATCH_TOKENS", "4096"))
+BATCH_TOKENS = int(os.environ.get("ARC_BATCH_TOKENS", "512"))   # prefill chunk; long-context output depends on it (README)
 MAX_NEW = int(os.environ.get("ARC_MAX_NEW", "8192"))
 MAX_CTX = int(os.environ.get("ARC_MAX_CTX", "65536"))
 THINK = os.environ.get("ARC_THINK", "0") == "1"
+# With thinking off, Gemma's template pre-closes an empty thought channel at the start of a model turn but not after a
+# tool response; ARC_CLOSE_THOUGHT_AFTER_TOOL=1 adds the same empty channel there too (experiment).
+CLOSE_AFTER_TOOL = os.environ.get("ARC_CLOSE_THOUGHT_AFTER_TOOL", "0") == "1"
 PARSER = os.environ.get("ARC_PARSER", "gemma4")
+PREFIX_CACHE = os.environ.get("ARC_PREFIX_CACHE", "0") == "1"   # must stay off with the RoPE-table patched export (README)
+LOG_DIR = os.environ.get("ARC_LOG_DIR", "")   # if set, each request body + raw output is saved there (debugging)
 
 import toolparse
 from toolparse import CH_OPEN, QUOTE, STRIP, TEXT_CALL, TOOL_OPEN, parse_output, runaway, safe_prefix
@@ -41,7 +46,20 @@ from toolparse import CH_OPEN, QUOTE, STRIP, TEXT_CALL, TOOL_OPEN, parse_output,
 toolparse.PARSER = PARSER
 
 tok = AutoTokenizer.from_pretrained(MODEL)
-STOP_IDS = {i for i in (tok.convert_tokens_to_ids(t) for t in ("<turn|>", "<eos>")) if isinstance(i, int) and i >= 0}
+def _stop_ids():
+    """The model's own stop tokens (generation_config.json eos_token_id; for Gemma 4: <eos>, <turn|> and <|tool_response>,
+    where the model hands over to the tool), plus <turn|>/<eos> if the config lacks them."""
+    ids = set()
+    try:
+        eos = json.load(open(os.path.join(MODEL, "generation_config.json"))).get("eos_token_id")
+        ids |= set(eos if isinstance(eos, list) else [eos] if eos is not None else [])
+    except (OSError, ValueError):
+        pass
+    ids |= {i for i in (tok.convert_tokens_to_ids(t) for t in ("<turn|>", "<eos>")) if isinstance(i, int) and i >= 0}
+    return ids
+
+
+STOP_IDS = _stop_ids()
 
 # ---------------------------------------------------------------- engine process
 # openvino_genai's ContinuousBatchingPipeline.step() holds the GIL while the GPU works. Run back-to-back in a thread of
@@ -55,12 +73,12 @@ def engine_main(inq, outq):
     sc.cache_size = CACHE_GB
     sc.max_num_seqs = MAX_SEQS
     sc.max_num_batched_tokens = BATCH_TOKENS
-    sc.enable_prefix_caching = True
+    sc.enable_prefix_caching = PREFIX_CACHE
     sc.dynamic_split_fuse = True
     t0 = time.time()
     pipe = og.ContinuousBatchingPipeline(MODEL, sc, DEVICE, {"DYNAMIC_QUANTIZATION_GROUP_SIZE": 0})
     print(f"[arcserve] loaded {MODEL} on {DEVICE} in {time.time() - t0:.0f}s: max_seqs={MAX_SEQS} cache={CACHE_GB}GB "
-          f"max_new={MAX_NEW} max_ctx={MAX_CTX} think={THINK} parser={PARSER}", flush=True)
+          f"max_new={MAX_NEW} max_ctx={MAX_CTX} think={THINK} parser={PARSER} prefix_cache={PREFIX_CACHE}", flush=True)
     outq.put(("ready", None, None))
     handles = {}
     while True:
@@ -132,10 +150,10 @@ def cancel(rid):
 
 def submit(prompt_text, cfg):
     """VLM exports run the language model on inputs_embeds, so the pipeline takes the rendered prompt text (it embeds it
-    itself); our HF chat template already rendered it, so the pipeline's own templating is off and <bos> is left to its
-    tokenizer."""
-    if prompt_text.startswith("<bos>"):
-        prompt_text = prompt_text[len("<bos>"):]
+    itself); our HF chat template already rendered it, so the pipeline's own templating is off. The rendered text must
+    keep <bos>: the OpenVINO tokenizer encodes it as the BOS token but never adds one itself."""
+    if not prompt_text.startswith("<bos>"):  # the OpenVINO tokenizer does NOT add <bos>; Gemma degenerates without it
+        prompt_text = "<bos>" + prompt_text
     q = queue.Queue()
     with id_lock:
         next_id[0] += 1
@@ -174,6 +192,8 @@ def build_prompt(body):
     kw = {"tools": body.get("tools")} if body.get("tools") else {}
     text = tok.apply_chat_template(to_messages(body["messages"]), add_generation_prompt=True, tokenize=False,
                                    enable_thinking=THINK, **kw)
+    if CLOSE_AFTER_TOOL and not THINK and text.rstrip().endswith("<tool_response|>"):
+        text += "<|channel>thought\n<channel|>"
     return text, tok(text, add_special_tokens=False)["input_ids"]
 
 
@@ -235,16 +255,27 @@ async def chat(req: Request):
     q = submit(prompt_text, cfg)
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
 
-    def collect():
-        out_ids, status = [], None
+    def collect(beat=None):
+        """Yields (ids so far, end). With beat, also yields (ids, None) every `beat` seconds while nothing arrives (long
+        prefills), so streaming clients get keep-alives."""
+        out_ids = []
         while True:
-            kind, v = q.get()
+            try:
+                kind, v = q.get(timeout=beat)
+            except queue.Empty:
+                yield out_ids, None; continue
             if kind == "ids":
                 out_ids.extend(v); yield out_ids, None
             else:
                 yield out_ids, (kind, v); return
 
     def finish(out_ids, text):
+        if LOG_DIR:
+            try:
+                with open(os.path.join(LOG_DIR, f"{created}-{cid}.json"), "w") as f:
+                    json.dump({"request": body, "raw_output": text, "prompt_tokens": len(ids), "out_ids": out_ids[:40]}, f)
+            except OSError:
+                pass
         content, calls = parse_output(text, body.get("tools"))
         if calls:  # drop exact duplicates (a looping reply repeats the same call)
             seen, uniq = set(), []
@@ -283,7 +314,7 @@ async def chat(req: Request):
             return "data: " + json.dumps(d) + "\n\n"
         yield chunk({"role": "assistant", "content": ""})
         sent, out_ids, beat, stopped = 0, [], time.time(), False
-        for out_ids, end in collect():
+        for out_ids, end in collect(beat=3):
             if end and end[0] == "error":
                 yield "data: " + json.dumps({"error": {"message": "generation failed: " + end[1]}}) + "\n\n"; return
             text = tok.decode(out_ids, skip_special_tokens=False)
